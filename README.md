@@ -17,7 +17,7 @@ make
 
 Подключитесь и отправьте сообщение (для выхода используйте ctrl+] затем q)
 
-telnet localhost <port>
+telnet localhost < port >
 
 Отпишитесь мне в телеграмм о ваших успехах в освоении компьютерсайнса @mikhail_golovach
 
