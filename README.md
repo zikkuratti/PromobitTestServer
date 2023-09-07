@@ -7,8 +7,11 @@ sudo apt-get install liburing-dev cmake
 Скачайте и соберите проект 
 
 mkdir build
+
 cd build
+
 cmake ..
+
 make
 
 Запустите сервер, указав порт в аргументе командной строки:
