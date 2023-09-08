@@ -10,10 +10,18 @@
 
 #define MAX_MESSAGE_LEN 128
 
+// Структура для хранения информации о клиентском соединении
+struct client_info {
+    int client_sock;
+    int file_fd;
+    struct sockaddr_in client_addr;
+};
+
 // Функция для обработки отключения клиента
-void handle_client_disconnect(int client_sock) {
+void handle_client_disconnect(struct client_info *client) {
     printf("Client disconnected\n");
-    close(client_sock);
+    close(client->file_fd);
+    close(client->client_sock);
 }
 
 int main(int argc, char *argv[]) {
@@ -62,62 +70,108 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    signal(SIGPIPE, SIG_IGN); // Игнорируем сигнал SIGPIPE
+    signal(SIGPIPE, SIG_IGN);
+
+    struct io_uring_cqe *cqe;
+    struct io_uring_sqe *sqe;
+    struct client_info clients[256]; // Массив информации о клиентах
+    memset(clients, 0, sizeof(clients));
 
     while (1) {
+        sqe = io_uring_get_sqe(&ring);
+
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int client_sock = accept(listen_sock, (struct sockaddr *)&client_addr, &client_len);
+
         if (client_sock < 0) {
             perror("accept");
             continue;
         }
 
-        // Создаем новый процесс для обработки клиента
-        pid_t pid = fork();
-        if (pid < 0) {
-            perror("fork");
+        int file_fd;
+        char filename[128];
+        snprintf(filename, sizeof(filename), "%d.txt", port);
+
+        file_fd = open(filename, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (file_fd < 0) {
+            perror("open");
             close(client_sock);
             continue;
-        } else if (pid == 0) { // Дочерний процесс
-            close(listen_sock); // Закрываем слушающий сокет в дочернем процессе
+        }
 
-            char filename[128];
-            snprintf(filename, sizeof(filename), "%d.txt", port);
-            int file_fd = open(filename, O_WRONLY | O_CREAT | O_APPEND, 0644);
-            if (file_fd < 0) {
-                perror("open");
-                close(client_sock);
+        // Заполняем информацию о клиенте
+        int client_index = -1;
+        for (int i = 0; i < 256; i++) {
+            if (clients[i].client_sock == 0) {
+                client_index = i;
+                break;
+            }
+        }
+
+        if (client_index == -1) {
+            fprintf(stderr, "Too many clients\n");
+            close(file_fd);
+            close(client_sock);
+            continue;
+        }
+
+        clients[client_index].client_sock = client_sock;
+        clients[client_index].file_fd = file_fd;
+        clients[client_index].client_addr = client_addr;
+
+        // Ожидание 3 секунд
+        sqe->opcode = IORING_OP_TIMEOUT;
+        sqe->flags = 0;
+        sqe->ioprio = 0;
+        sqe->fd = 0;
+        sqe->off = 0;
+        sqe->addr = 0;
+        sqe->len = 0;
+        sqe->timeout_flags = 0;
+        sqe->timeout_spec.tv_sec = 3;
+        sqe->timeout_spec.tv_nsec = 0;
+
+        io_uring_submit(&ring);
+
+        // Ожидаем завершения операции ожидания тайм-аута
+        while (1) {
+            int ret = io_uring_wait_cqe(&ring, &cqe);
+            if (ret < 0) {
+                perror("io_uring_wait_cqe");
                 exit(1);
             }
 
-            char buffer[MAX_MESSAGE_LEN];
-            ssize_t bytes_received;
-            while ((bytes_received = recv(client_sock, buffer, sizeof(buffer), 0)) > 0) {
-                // Сохраняем сообщение в файл
-                write(file_fd, buffer, bytes_received);
-
-                // Ожидание 3 секунд
-                sleep(3);
-
-                // Отправляем "ACCEPTED" клиенту
-                const char *response = "ACCEPTED\n";
-                send(client_sock, response, strlen(response), 0);
+            if (cqe->user_data == (unsigned long)sqe) {
+                io_uring_cqe_seen(&ring, cqe);
+                break;
             }
 
-            // Обработка отключения клиента по инициативе клиента
-            if (bytes_received == 0) {
-                handle_client_disconnect(client_sock);
-            } else {
-                perror("recv");
-            }
-
-            close(file_fd);
-            close(client_sock);
-            exit(0);
-        } else { // Родительский процесс
-            close(client_sock); // Закрываем сокет в родительском процессе
+            io_uring_cqe_seen(&ring, cqe);
         }
+
+        // Отправляем "ACCEPTED" клиенту
+        const char *response = "ACCEPTED\n";
+        sqe = io_uring_get_sqe(&ring);
+        sqe->opcode = IORING_OP_SEND;
+        sqe->flags = 0;
+        sqe->ioprio = 0;
+        sqe->fd = client_sock;
+        sqe->off = 0;
+        sqe->addr = (unsigned long)response;
+        sqe->len = strlen(response);
+        sqe->timeout_flags = 0;
+        sqe->timeout_spec.tv_sec = 0;
+        sqe->timeout_spec.tv_nsec = 0;
+
+        io_uring_submit(&ring);
+
+        // Сброс информации о клиенте
+        clients[client_index].client_sock = 0;
+        clients[client_index].file_fd = 0;
+
+        io_uring_wait_cqe(&ring, &cqe);
+        io_uring_cqe_seen(&ring, cqe);
     }
 
     io_uring_queue_exit(&ring);
